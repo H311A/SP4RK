@@ -1,224 +1,219 @@
-import uuid
-from collections import defaultdict
+import io
+import logging
 
 import discord
 
+from app.bot import formatting as fmt
+from app.bot.roles import ROLE_LABELS, ROLE_ORDER
+from app.config import settings
 from app.database.session import SessionLocal
-from app.repositories import classes as class_repo
-from app.repositories import raids as raid_repo
-from app.repositories.raids import is_registration_open, utcnow
+from app.repositories.classes import list_classes
+from app.repositories.raids import get_raid
+from app.services import banners
 from app.utils.time import discord_ts, short_id
 
-BRAND_COLOR = 0x7C5CFF
-CLOSED_COLOR = 0x2F3136
-WARNING_COLOR = 0xF5C451
+log = logging.getLogger("SP4RK.raids")
+
+FIELD_VALUE_LIMIT = 1024
 
 
-def _safe_display_name(signup) -> str:
-    name = str(getattr(signup, "display_name", "") or f"ID {signup.user_id}").replace("\n", " ").strip()
-    name = discord.utils.escape_mentions(discord.utils.escape_markdown(name))
-    if len(name) > 80:
-        name = name[:77].rstrip() + "..."
-    return name or f"ID {signup.user_id}"
+def _truncate(value: str, limit: int = FIELD_VALUE_LIMIT) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
 
 
-def _sorted_signups(signups):
-    return sorted(signups, key=lambda s: (getattr(s, "joined_at", None) is None, getattr(s, "joined_at", None), str(s.user_id)))
+def banner_filename(raid_id) -> str:
+    return f"banner_{raid_id.hex}.png"
 
 
-def _participant_link(signup, number: int) -> str:
-    # Не используем сырой <@id> в карточке: часть клиентов Discord иногда показывает его цифрами.
-    # Вместо этого делаем кликабельный компактный номер профиля + сохранённый никнейм участника.
-    return f"[[{number}](https://discord.com/users/{signup.user_id})] {_safe_display_name(signup)}"
+def _class_icon_or_fallback(cls) -> str:
+    return fmt.class_icon_text(cls) if cls is not None else "❔"
 
 
-def _numbered_participants(signups) -> str:
-    items = _sorted_signups(signups)
-    if not items:
-        return "—"
-    return "\n".join(_participant_link(signup, idx) for idx, signup in enumerate(items, start=1))
+def _cluster_by_class(entries: list) -> list:
+    order = []
+    grouped: dict = {}
+    for s, cls in entries:
+        key = cls.id if cls is not None else None
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append((s, cls))
+    return [pair for key in order for pair in grouped[key]]
 
 
-def _compact_participants(signups) -> str:
-    items = _sorted_signups(signups)
-    if not items:
-        return "—"
-    return ", ".join(_participant_link(signup, idx) for idx, signup in enumerate(items, start=1))
+def _group_by_role(signups, classes_by_id: dict) -> list[tuple[str, list]]:
+    buckets: dict[str | None, list] = {}
+    for s in signups:
+        cls = classes_by_id.get(s.class_id)
+        role = cls.role if cls else None
+        buckets.setdefault(role, []).append((s, cls))
 
-
-def _limit_text(limit_count: int | None) -> str:
-    return "∞" if not limit_count else str(limit_count)
-
-
-def _minutes_phrase(minutes: int) -> str:
-    if 11 <= minutes % 100 <= 14:
-        word = "минут"
-    elif minutes % 10 == 1:
-        word = "минуту"
-    elif 2 <= minutes % 10 <= 4:
-        word = "минуты"
-    else:
-        word = "минут"
-    return f"{minutes} {word}"
-
-
-def _status_text(raid, open_now: bool) -> tuple[str, int]:
-    if raid.cancelled:
-        return "🗑️  Событие отменено.", CLOSED_COLOR
-    if raid.archived or raid.starts_at <= utcnow():
-        return "🏁 Событие завершено.", CLOSED_COLOR
-    if not open_now:
-        return "🔒 Регистрация закрыта.", WARNING_COLOR
-    return "🟢 Регистрация открыта.", BRAND_COLOR
-
-
-def _safe_embed_title(title: str) -> tuple[str, str | None]:
-    title = (title or "Событие").strip()
-    if len(title) <= 240:
-        return title, None
-    return "SP4RK • Событие", title
-
-
-def build_raid_embed(raid, raid_classes) -> discord.Embed:
-    open_now = is_registration_open(raid)
-    state, color = _status_text(raid, open_now)
-
-    embed_title, long_title = _safe_embed_title(raid.title)
-    description_lines: list[str] = []
-
-    if long_title:
-        description_lines.append(long_title)
-        description_lines.append("")
-
-    if raid.description:
-        description_lines.append(raid.description.strip())
-        description_lines.append("")
-
-    description_lines.extend(
-        [
-            f"🕒 **Начало:** {discord_ts(raid.starts_at, 'F')}.",
-            f"⏳ **Начнётся:** {discord_ts(raid.starts_at, 'R')}.",
-            "🔒 **Запись закрывается:** за **1 минуту** до начала.",
-            f"🔔 **ЛС-напоминание:** за **{_minutes_phrase(raid.reminder_minutes)}** до начала.",
-            f"🆔 **ID:** `{short_id(raid.id)}`.",
-        ]
-    )
-
-    embed = discord.Embed(
-        title=embed_title,
-        description="\n".join(description_lines),
-        color=color,
-    )
-
-    accepted_total = sum(1 for s in raid.signups if s.status == "accepted")
-    participant_limit = getattr(raid, "participant_limit", 0) or 0
-    accepted_limit_text = f"{accepted_total}/{participant_limit}" if participant_limit else str(accepted_total)
-    backup_total = sum(1 for s in raid.signups if s.status == "backup")
-    maybe_total = sum(1 for s in raid.signups if s.status == "maybe")
-    declined_total = sum(1 for s in raid.signups if s.status == "declined")
-
-    embed.add_field(
-        name="**СТАТУС СОБЫТИЯ**",
-        value=(
-            f"{state}\n"
-            f"✅ Основной состав: **{accepted_limit_text}**.\n"
-            f"🪑 Запас: **{backup_total}**.\n"
-            f"❔ Возможно будут: **{maybe_total}**.\n"
-            f"❌ Точно не будут: **{declined_total}**."
-        ),
-        inline=False,
-    )
-
-    accepted_classes = []
-    for cls in raid_classes:
-        members = [
-            s for s in raid.signups
-            if s.status == "accepted" and s.class_id == cls.id
-        ]
-        if not members:
+    blocks = []
+    for role in ROLE_ORDER:
+        entries = buckets.get(role)
+        if not entries:
             continue
-        limit = _limit_text(cls.limit_count)
-        accepted_classes.append((cls, members, limit))
+        blocks.append((ROLE_LABELS[role], _cluster_by_class(entries)))
+    return blocks
 
-    if accepted_classes:
-        embed.add_field(
-            name="**СОСТАВ ПО КЛАССАМ**",
-            value=" ",
-            inline=False,
-        )
-        for cls, members, limit in accepted_classes[:24]:
-            if getattr(cls, "limit_count", 0):
-                field_name = f"{cls.icon} {cls.name} [{len(members)}/{limit}]"
-            else:
-                field_name = f"{cls.icon} {cls.name}"
-            embed.add_field(
-                name=field_name,
-                value=_numbered_participants(members)[:1000],
-                inline=True,
-            )
-    else:
-        embed.add_field(
-            name="**СОСТАВ ПО КЛАССАМ**",
-            value="Пока никто не записался.",
-            inline=False,
-        )
 
-    backup_by_class = defaultdict(list)
-    for signup in raid.signups:
-        if signup.status == "backup":
-            backup_by_class[signup.class_id].append(signup)
+def _group_by_role_detailed(signups, classes_by_id: dict) -> list[tuple[str, str]]:
+    buckets: dict[str | None, dict] = {}
+    for s in signups:
+        cls = classes_by_id.get(s.class_id)
+        role = cls.role if cls else None
+        by_class = buckets.setdefault(role, {})
+        by_class.setdefault(s.class_id, {"cls": cls, "members": []})
+        by_class[s.class_id]["members"].append(s)
 
-    backup_classes = []
-    for cls in raid_classes:
-        members = backup_by_class.get(cls.id, [])
-        if members:
-            backup_classes.append((cls, members))
+    blocks = []
+    for role in ROLE_ORDER:
+        by_class = buckets.get(role)
+        if not by_class:
+            continue
+        parts = []
+        for entry in by_class.values():
+            cls = entry["cls"]
+            header = f"**{fmt.class_icon_text(cls)} {cls.name}**" if cls is not None else "**Без класса**"
+            body = "\n".join(fmt.participant_link(s) for s in entry["members"])
+            parts.append(f"{header}\n{body}")
+        blocks.append((ROLE_LABELS[role], "\n\n".join(parts)))
+    return blocks
 
-    if backup_classes:
-        embed.add_field(name="**ЗАПАСНЫЕ**", value=" ", inline=False)
-        for cls, members in backup_classes[:12]:
-            embed.add_field(
-                name=f"🪑 {cls.icon} {cls.name}",
-                value=_numbered_participants(members)[:1000],
-                inline=True,
-            )
 
-    maybe = [s for s in raid.signups if s.status == "maybe"]
-    if maybe:
-        embed.add_field(
-            name="**ВОЗМОЖНО БУДУТ**",
-            value=_numbered_participants(maybe)[:1000],
-            inline=False,
-        )
+def build_roster_breakdown_embed(raid, classes) -> discord.Embed:
+    accepted = fmt.sorted_signups(raid.signups, "accepted")
+    backup = fmt.sorted_signups(raid.signups, "backup")
+    maybe = fmt.sorted_signups(raid.signups, "maybe")
+    classes_by_id = {c.id: c for c in classes}
 
-    declined = [s for s in raid.signups if s.status == "declined"]
-    if declined:
-        embed.add_field(
-            name="**ТОЧНО НЕ БУДУТ**",
-            value=_numbered_participants(declined)[:1000],
-            inline=False,
-        )
+    title, _overflow = fmt.safe_embed_title(raid.title)
+    embed = discord.Embed(title=f"Участники: {title}", color=settings.brand_color)
 
-    embed.set_footer(text="SP4RK • Stormchasers • Запись через кнопки ниже.")
+    sections = [
+        ("СОСТАВ ПО КЛАССАМ", accepted),
+        ("ЗАПАСНЫЕ", backup),
+        ("ВОЗМОЖНО БУДУТ", maybe),
+    ]
+    for section_name, signups in sections:
+        if not signups:
+            continue
+        blocks = _group_by_role_detailed(signups, classes_by_id)
+        text = "\n\n".join(f"**{label}**\n{block}" for label, block in blocks)
+        embed.add_field(name=section_name, value=_truncate(text), inline=False)
+
+    if not any(signups for _name, signups in sections):
+        embed.description = "Пока никто не записался."
+
     return embed
 
 
-async def refresh_raid_message(bot: discord.Client, raid_id: uuid.UUID) -> None:
-    async with SessionLocal() as session:
-        raid = await raid_repo.get_raid(session, raid_id)
-        if not raid or not raid.message_id:
-            return
-        raid_classes = await class_repo.list_classes(session, raid.guild_id)
+def build_raid_embed(raid, classes) -> discord.Embed:
+    open_now = fmt.is_open_now(raid)
+    status_word, status_color = fmt.status_text(raid, open_now)
+    dot = fmt.status_dot(status_color)
+    title, overflow = fmt.safe_embed_title(raid.title)
 
-    channel = bot.get_channel(raid.channel_id) or await bot.fetch_channel(raid.channel_id)
-    message = await channel.fetch_message(raid.message_id)
-    from app.bot.ui import build_signup_view
-    await message.edit(
-        embed=build_raid_embed(raid, raid_classes),
-        view=build_signup_view(
-            raid.id,
-            raid_classes,
-            disabled=not is_registration_open(raid),
-        ),
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+    description_parts = []
+    if raid.description:
+        description_parts.append(raid.description)
+    if overflow:
+        description_parts.append(overflow)
+    description = "\n\n".join(description_parts) if description_parts else None
+
+    if status_color:
+        embed_color = status_color
+    elif raid.game:
+        embed_color = raid.game.color
+    else:
+        embed_color = settings.brand_color
+
+    embed = discord.Embed(title=title, description=description, color=embed_color)
+
+    info_lines = [
+        f"{dot} Регистрация {status_word}.",
+        f"\U0001F550 Начало: {discord_ts(raid.starts_at, 'F')}.",
+        f"⏳ Начнётся: {discord_ts(raid.starts_at, 'R')}.",
+        f"\U0001F3C1 Окончание: {discord_ts(raid.ends_at, 'f')}.",
+        "",
+        f"\U0001F512 Запись закрывается: за 1 минуту до начала.",
+        f"\U0001F514 ЛС-напоминание: за {fmt.minutes_phrase(raid.reminder_minutes)} до начала.",
+    ]
+    embed.add_field(name="ИНФОРМАЦИЯ", value="\n".join(info_lines), inline=False)
+
+    accepted = fmt.sorted_signups(raid.signups, "accepted")
+    backup = fmt.sorted_signups(raid.signups, "backup")
+    maybe = fmt.sorted_signups(raid.signups, "maybe")
+    declined = fmt.sorted_signups(raid.signups, "declined")
+    total_limit = fmt.limit_text(raid.participant_limit)
+
+    classes_by_id = {c.id: c for c in classes}
+
+    if accepted:
+        embed.add_field(
+            name="ОСНОВНОЙ СОСТАВ", value=f"Занято {len(accepted)} из {total_limit}.", inline=False
+        )
+        for role_label, entries in _group_by_role(accepted, classes_by_id):
+            lines = [f"{_class_icon_or_fallback(cls)} {fmt.participant_link(s)}" for s, cls in entries]
+            embed.add_field(
+                name=f"{role_label} ({len(entries)})", value=_truncate("\n".join(lines)), inline=False
+            )
+
+    if backup:
+        lines = [f"{_class_icon_or_fallback(classes_by_id.get(s.class_id))} {fmt.participant_link(s)}" for s in backup]
+        embed.add_field(name=f"ЗАПАСНЫЕ ({len(backup)})", value=_truncate("\n".join(lines)), inline=False)
+
+    if maybe:
+        line = " ".join(
+            f"{_class_icon_or_fallback(classes_by_id.get(s.class_id))} {fmt.participant_link(s)}" for s in maybe
+        )
+        embed.add_field(name=f"ВОЗМОЖНО БУДУТ ({len(maybe)})", value=_truncate(line), inline=False)
+
+    if declined:
+        line = ", ".join(fmt.participant_link(s) for s in declined)
+        embed.add_field(name=f"ТОЧНО НЕ БУДУТ ({len(declined)})", value=_truncate(line), inline=False)
+
+    game_label = f"{raid.game.icon} {raid.game.name}" if raid.game else ""
+    embed.set_footer(text=f"ID {short_id(raid.id)} · {game_label}")
+    return embed
+
+
+def build_message_payload(raid, classes) -> tuple[discord.Embed, list[discord.Embed], list[discord.File]]:
+    main_embed = build_raid_embed(raid, classes)
+    files: list[discord.File] = []
+
+    banner_bytes = banners.read_banner(raid.banner_path)
+    if banner_bytes:
+        filename = banner_filename(raid.id)
+        files.append(discord.File(io.BytesIO(banner_bytes), filename=filename))
+        main_embed.set_image(url=f"attachment://{filename}")
+
+    return main_embed, [main_embed], files
+
+
+async def refresh_raid_message(bot: discord.Client, raid_id) -> None:
+    from app.bot.views.signup import build_signup_view
+
+    async with SessionLocal() as session:
+        raid = await get_raid(session, raid_id)
+        if raid is None:
+            return
+        classes = await list_classes(session, raid.game_id, active_only=False)
+        session.expunge_all()
+
+    if not raid.channel_id or not raid.message_id:
+        return
+
+    try:
+        channel = bot.get_channel(raid.channel_id) or await bot.fetch_channel(raid.channel_id)
+        message = await channel.fetch_message(raid.message_id)
+    except (discord.NotFound, discord.Forbidden):
+        return
+
+    _main_embed, embeds, files = build_message_payload(raid, classes)
+    open_now = fmt.is_open_now(raid)
+    view = build_signup_view(raid.id, classes, disabled=not open_now)
+
+    await message.edit(embeds=embeds, attachments=files, view=view)

@@ -12,15 +12,5 @@ services:
     volumes:
       - spark_postgres_data:/var/lib/postgresql/data
 
-  redis:
-    image: redis:7
-    container_name: spark_redis
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-    volumes:
-      - spark_redis_data:/data
-
 volumes:
   spark_postgres_data:
-  spark_redis_data:

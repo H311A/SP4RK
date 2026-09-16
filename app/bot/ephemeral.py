@@ -56,11 +56,6 @@ def schedule_delete_message(message, delay: int | None = None) -> None:
 
 
 async def send_ephemeral_followup(interaction: discord.Interaction, *args, delete_after: int | None = None, **kwargs):
-    """Send an ephemeral followup and delete it after EPHEMERAL_DELETE_AFTER seconds.
-
-    Discord.py's `delete_after` is not reliable for ephemeral interaction replies in all versions,
-    so we request the returned webhook message with `wait=True` and delete it manually.
-    """
     kwargs["ephemeral"] = True
     kwargs["wait"] = True
     message = await interaction.followup.send(*args, **kwargs)
@@ -68,13 +63,44 @@ async def send_ephemeral_followup(interaction: discord.Interaction, *args, delet
     return message
 
 
-def install_ephemeral_autodelete_patch() -> None:
-    """Make InteractionResponse.send_message(..., ephemeral=True, delete_after=N) reliable.
+class AutoExpireView(discord.ui.View):
+    def __init__(self, *, timeout: float | None = None):
+        super().__init__(timeout=timeout or settings.menu_idle_timeout_seconds)
+        self._owner_interaction: discord.Interaction | None = None
 
-    Existing code can continue to pass `delete_after=EPHEMERAL_DELETE_AFTER`. For ephemeral
-    responses we remove the parameter before calling discord.py and delete the original
-    interaction response ourselves after the configured delay.
-    """
+    def bind(self, interaction: discord.Interaction) -> None:
+        self._owner_interaction = interaction
+
+    async def on_timeout(self) -> None:
+        if self._owner_interaction is None:
+            return
+        try:
+            await self._owner_interaction.delete_original_response()
+        except (discord.NotFound, discord.HTTPException, discord.Forbidden):
+            pass
+
+
+async def show_screen(interaction: discord.Interaction, *, embed=None, content=None, view=None):
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.edit_message(content=content, embed=embed, view=view)
+        else:
+            await interaction.edit_original_response(content=content, embed=embed, view=view)
+    except (discord.NotFound, discord.HTTPException) as exc:
+        log.warning("show_screen could not update message, likely already removed: %s", exc)
+        try:
+            await send_ephemeral_followup(
+                interaction, "Это меню уже устарело, вызови его заново через /spark."
+            )
+        except (discord.NotFound, discord.HTTPException):
+            pass
+        return
+
+    if isinstance(view, AutoExpireView):
+        view.bind(interaction)
+
+
+def install_ephemeral_autodelete_patch() -> None:
     if getattr(discord.InteractionResponse.send_message, "_sp4rk_ephemeral_patch", False):
         return
 

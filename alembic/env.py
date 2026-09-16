@@ -1,8 +1,11 @@
 from logging.config import fileConfig
+
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
+
 from alembic import context
+
 from app.config import settings
 from app.database.models import Base
 
@@ -13,19 +16,26 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
+
 def run_migrations_offline() -> None:
     context.configure(url=settings.database_url, target_metadata=target_metadata, literal_binds=True)
     with context.begin_transaction():
         context.run_migrations()
 
+
 def do_run_migrations(connection: Connection) -> None:
-    try:
-        connection.exec_driver_sql("ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(128)")
-    except Exception:
-        pass
+    connection.exec_driver_sql(
+        "CREATE TABLE IF NOT EXISTS alembic_version ("
+        "version_num VARCHAR(128) NOT NULL, "
+        "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)"
+        ")"
+    )
+    connection.exec_driver_sql("ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(128)")
+    connection.commit()
     context.configure(connection=connection, target_metadata=target_metadata)
     with context.begin_transaction():
         context.run_migrations()
+
 
 async def run_async_migrations() -> None:
     connectable = async_engine_from_config(
@@ -37,9 +47,12 @@ async def run_async_migrations() -> None:
         await connection.run_sync(do_run_migrations)
     await connectable.dispose()
 
+
 def run_migrations_online() -> None:
     import asyncio
+
     asyncio.run(run_async_migrations())
+
 
 if context.is_offline_mode():
     run_migrations_offline()

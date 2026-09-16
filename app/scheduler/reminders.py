@@ -2,7 +2,10 @@ import logging
 
 import discord
 
+from app.bot import formatting as fmt
+from app.database.models import Raid
 from app.database.session import SessionLocal
+from app.repositories.attendance import snapshot_raid_attendance
 from app.repositories.raids import (
     archive_raid,
     delete_raid,
@@ -11,17 +14,20 @@ from app.repositories.raids import (
     mark_reminder_sent,
     old_raids_to_purge,
 )
+from app.services import events_calendar
 from app.services.raids import refresh_raid_message
 from app.utils.time import discord_ts
 
 log = logging.getLogger("SP4RK.reminders")
 REMINDER_STATUSES = {"accepted", "backup", "maybe"}
+STATUS_LABELS = {
+    "accepted": "Основной состав",
+    "backup": "Запас",
+    "maybe": "Возможно будете",
+}
 
 
-async def _raid_message_exists(bot: discord.Client, raid) -> bool:
-    # У события может ещё не быть message_id в первые секунды после создания:
-    # карточка уже отправляется, но ID сообщения ещё не успел сохраниться в БД.
-    # Такое событие нельзя удалять как "потерянное".
+async def _raid_message_exists(bot: discord.Client, raid: Raid) -> bool:
     if not raid.message_id:
         return True
     try:
@@ -35,22 +41,17 @@ async def _raid_message_exists(bot: discord.Client, raid) -> bool:
         return True
 
 
-async def _delete_raid_message(bot: discord.Client, raid) -> bool:
+async def _delete_raid_message(bot: discord.Client, raid: Raid) -> None:
     if not raid.message_id:
-        return False
+        return
     try:
         channel = bot.get_channel(raid.channel_id) or await bot.fetch_channel(raid.channel_id)
         message = await channel.fetch_message(raid.message_id)
         await message.delete()
-        return True
-    except discord.NotFound:
-        return False
-    except discord.Forbidden:
-        log.warning("No permissions to delete old raid message: %s", raid.id)
-        return False
+    except (discord.NotFound, discord.Forbidden):
+        pass
     except Exception as exc:
         log.warning("Could not delete old raid message %s: %s", raid.id, exc)
-        return False
 
 
 async def send_due_reminders(bot: discord.Client) -> None:
@@ -72,32 +73,26 @@ async def send_due_reminders(bot: discord.Client) -> None:
             for signup in raid.signups:
                 if signup.status not in REMINDER_STATUSES:
                     continue
-                if not getattr(signup, "notifications_enabled", True):
+                if not signup.notifications_enabled:
                     continue
 
                 try:
                     user = await bot.fetch_user(signup.user_id)
                     cls = signup.raid_class
-
-                    if signup.status == "accepted":
-                        status_text = "Основной состав"
-                    elif signup.status == "backup":
-                        status_text = "Запас"
-                    else:
-                        status_text = "Возможно будете"
-
                     await user.send(
-                        "\n".join([
-                            "**Напоминание о событии**",
-                            "",
-                            f"**{raid.title}**",
-                            f"🕒 Начало: {discord_ts(raid.starts_at, 'F')}.",
-                            f"⏳ Начнётся: {discord_ts(raid.starts_at, 'R')}.",
-                            f"Статус: **{status_text}**.",
-                            f"Класс: {cls.icon + ' ' + cls.name if cls else 'не выбран'}.",
-                            "",
-                            "Участники события ждут тебя.",
-                        ])
+                        "\n".join(
+                            [
+                                "**Напоминание о событии**",
+                                "",
+                                f"**{raid.title}**",
+                                f"Начало: {discord_ts(raid.starts_at, 'F')}.",
+                                f"Начнётся: {discord_ts(raid.starts_at, 'R')}.",
+                                f"Статус: **{STATUS_LABELS[signup.status]}**.",
+                                f"Класс: {fmt.class_icon_text(cls) + ' ' + cls.name if cls else 'не выбран'}.",
+                                "",
+                                "Участники события ждут тебя.",
+                            ]
+                        )
                     )
                     sent_count += 1
                 except discord.Forbidden:
@@ -131,7 +126,7 @@ async def maintain_raids(bot: discord.Client) -> None:
             log.info("Raid archived and message refreshed: %s", raid.id)
         except discord.NotFound:
             async with SessionLocal() as session:
-                db_raid = await session.get(type(raid), raid.id)
+                db_raid = await session.get(Raid, raid.id)
                 if db_raid:
                     await delete_raid(session, db_raid)
                     await session.commit()
@@ -145,9 +140,13 @@ async def maintain_raids(bot: discord.Client) -> None:
         old_raids = await old_raids_to_purge(session)
         deleted = 0
         for raid in old_raids:
+            await snapshot_raid_attendance(session, raid)
+            guild = bot.get_guild(raid.guild_id)
+            if guild is not None:
+                await events_calendar.delete_scheduled_event(guild, raid.discord_event_id)
             await _delete_raid_message(bot, raid)
             await delete_raid(session, raid)
             deleted += 1
         await session.commit()
         if deleted:
-            log.info("Deleted %s old raid card(s) and purged raid(s) from database", deleted)
+            log.info("Purged %s old raid(s), attendance snapshot kept", deleted)
